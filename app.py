@@ -1,356 +1,371 @@
 from __future__ import annotations
 
-import math
-import time
-from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
+from datetime import datetime, timezone
 from typing import Any, Iterable
 
+import altair as alt
+import folium
 import pandas as pd
 import requests
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
+from streamlit_folium import st_folium
 
-APP_DIR = Path(__file__).resolve().parent
-LOCATIONS_FILE = APP_DIR / "locations.csv"
+
+st.set_page_config(
+    page_title="Gillsburg Weather",
+    page_icon="🌦️",
+    layout="wide",
+)
+
 WEATHERLINK_BASE = "https://api.weatherlink.com/v2"
-OPENWEATHER_CURRENT = "https://api.openweathermap.org/data/2.5/weather"
-REQUEST_TIMEOUT = 20
+OPENWEATHER_BASE = "https://api.openweathermap.org/data/4.0/onecall"
+RAINVIEWER_INDEX = "https://api.rainviewer.com/public/weather-maps.json"
 
 
-@dataclass
-class Conditions:
-    name: str
-    source: str
-    region: str
-    latitude: float
-    longitude: float
-    observed_at: datetime | None = None
-    wind_mph: float | None = None
-    gust_mph: float | None = None
-    wind_degrees: float | None = None
-    rain_in: float | None = None
-    pressure_inhg: float | None = None
-    temperature_f: float | None = None
-    humidity_pct: float | None = None
-    description: str | None = None
-    error: str | None = None
-
-
-def secret(name: str, default: Any = "") -> Any:
+def secret(name: str, default: Any = None) -> Any:
     try:
-        return st.secrets.get(name, default)
+        return st.secrets[name]
     except Exception:
         return default
 
 
-def safe_float(value: Any) -> float | None:
-    try:
-        if value is None or value == "":
-            return None
-        result = float(value)
-        return result if math.isfinite(result) else None
-    except (TypeError, ValueError):
-        return None
+WEATHERLINK_API_KEY = secret("WEATHERLINK_API_KEY")
+WEATHERLINK_API_SECRET = secret("WEATHERLINK_API_SECRET")
+WEATHERLINK_STATION_ID = secret("WEATHERLINK_STATION_ID")
+OPENWEATHER_API_KEY = secret("OPENWEATHER_API_KEY")
+FALLBACK_LAT = secret("GILLSBURG_LAT")
+FALLBACK_LON = secret("GILLSBURG_LON")
 
 
-def first_value(records: Iterable[dict[str, Any]], keys: Iterable[str]) -> float | None:
-    for record in records:
-        for key in keys:
-            if key in record:
-                value = safe_float(record.get(key))
-                if value is not None:
-                    return value
-    return None
+def require_secrets() -> None:
+    missing = [
+        name
+        for name, value in {
+            "WEATHERLINK_API_KEY": WEATHERLINK_API_KEY,
+            "WEATHERLINK_API_SECRET": WEATHERLINK_API_SECRET,
+            "WEATHERLINK_STATION_ID": WEATHERLINK_STATION_ID,
+            "OPENWEATHER_API_KEY": OPENWEATHER_API_KEY,
+        }.items()
+        if not value
+    ]
+    if missing:
+        st.error("Missing Streamlit secrets: " + ", ".join(missing))
+        st.stop()
 
 
-def wind_compass(degrees: float | None) -> str:
-    if degrees is None:
-        return "—"
-    points = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
-    return points[int((degrees + 11.25) // 22.5) % 16]
+def get_json(url: str, *, params: dict[str, Any] | None = None,
+             headers: dict[str, str] | None = None, timeout: int = 20) -> dict[str, Any]:
+    response = requests.get(url, params=params, headers=headers, timeout=timeout)
+    response.raise_for_status()
+    return response.json()
 
 
-def fmt(value: float | None, digits: int = 1) -> str:
-    return "—" if value is None else f"{value:.{digits}f}"
-
-
-def observation_age(observed_at: datetime | None) -> str:
-    if observed_at is None:
-        return "Unknown update time"
-    seconds = max(0, int(time.time() - observed_at.timestamp()))
-    if seconds < 60:
-        return "Updated just now"
-    if seconds < 3600:
-        return f"Updated {seconds // 60} min ago"
-    return f"Updated {seconds // 3600} hr ago"
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def weatherlink_stations(api_key: str, api_secret: str) -> list[dict[str, Any]]:
-    response = requests.get(
+@st.cache_data(ttl=600, show_spinner=False)
+def get_weatherlink_stations(api_key: str, api_secret: str) -> dict[str, Any]:
+    return get_json(
         f"{WEATHERLINK_BASE}/stations",
         params={"api-key": api_key},
         headers={"X-Api-Secret": api_secret},
-        timeout=REQUEST_TIMEOUT,
     )
-    response.raise_for_status()
-    payload = response.json()
-    return payload.get("stations", [])
 
 
-@st.cache_data(ttl=240, show_spinner=False)
-def weatherlink_current(api_key: str, api_secret: str, station_id: int) -> dict[str, Any]:
-    response = requests.get(
+@st.cache_data(ttl=60, show_spinner=False)
+def get_weatherlink_current(api_key: str, api_secret: str, station_id: str) -> dict[str, Any]:
+    return get_json(
         f"{WEATHERLINK_BASE}/current/{station_id}",
         params={"api-key": api_key},
         headers={"X-Api-Secret": api_secret},
-        timeout=REQUEST_TIMEOUT,
     )
-    response.raise_for_status()
-    return response.json()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_openweather_current(api_key: str, lat: float, lon: float) -> dict[str, Any]:
+    return get_json(
+        f"{OPENWEATHER_BASE}/current",
+        params={"lat": lat, "lon": lon, "units": "imperial", "lang": "en", "appid": api_key},
+    )
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_openweather_15min(api_key: str, lat: float, lon: float) -> dict[str, Any]:
+    return get_json(
+        f"{OPENWEATHER_BASE}/timeline/15min",
+        params={"lat": lat, "lon": lon, "units": "imperial", "lang": "en", "appid": api_key},
+    )
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def get_openweather_daily(api_key: str, lat: float, lon: float) -> dict[str, Any]:
+    return get_json(
+        f"{OPENWEATHER_BASE}/timeline/1day",
+        params={"lat": lat, "lon": lon, "units": "imperial", "lang": "en", "appid": api_key},
+    )
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def get_rainviewer_index() -> dict[str, Any]:
+    return get_json(RAINVIEWER_INDEX)
 
 
 def flatten_weatherlink_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for sensor in payload.get("sensors", []):
-        data = sensor.get("data", [])
-        if isinstance(data, dict):
-            data = [data]
-        if isinstance(data, list):
-            for record in data:
-                if isinstance(record, dict):
-                    enriched = dict(record)
-                    enriched["_sensor_type"] = sensor.get("sensor_type")
-                    enriched["_data_structure_type"] = sensor.get("data_structure_type")
-                    records.append(enriched)
+        for item in sensor.get("data", []):
+            if isinstance(item, dict):
+                records.append(item)
     return records
 
 
-def parse_weatherlink(name: str, region: str, latitude: float, longitude: float, payload: dict[str, Any]) -> Conditions:
-    records = flatten_weatherlink_records(payload)
-    timestamps = [safe_float(r.get("ts")) for r in records]
-    timestamp = max((t for t in timestamps if t is not None), default=None)
+def first_value(records: Iterable[dict[str, Any]], *keys: str) -> Any:
+    for key in keys:
+        for record in records:
+            value = record.get(key)
+            if value is not None:
+                return value
+    return None
 
-    # Davis field names vary by console/sensor type. These ordered candidates
-    # cover the common Vantage Pro2/ISS and barometer records.
-    wind_mph = first_value(records, ["wind_speed_last", "wind_speed_avg_last_1_min", "wind_speed_hi_last_10_min", "wind_speed"])
-    gust_mph = first_value(records, ["wind_speed_hi_last_10_min", "wind_speed_hi_last_2_min", "wind_gust", "wind_speed_hi"])
-    wind_degrees = first_value(records, ["wind_dir_last", "wind_dir_scalar_avg_last_1_min", "wind_dir_at_hi_speed_last_10_min", "wind_dir"])
-    rain_in = first_value(records, ["rainfall_daily_in", "rainfall_last_15_min_in", "rainfall_last_60_min_in", "rainfall_last_24_hr_in", "rainfall_in"])
-    pressure_inhg = first_value(records, ["bar_sea_level", "bar_absolute", "pressure_in", "barometer"])
-    temperature_f = first_value(records, ["temp", "temp_out", "temperature"])
-    humidity_pct = first_value(records, ["hum", "hum_out", "humidity"])
 
-    return Conditions(
-        name=name,
-        source="Davis WeatherLink",
-        region=region,
-        latitude=latitude,
-        longitude=longitude,
-        observed_at=datetime.fromtimestamp(timestamp) if timestamp else None,
-        wind_mph=wind_mph,
-        gust_mph=gust_mph,
-        wind_degrees=wind_degrees,
-        rain_in=rain_in,
-        pressure_inhg=pressure_inhg,
-        temperature_f=temperature_f,
-        humidity_pct=humidity_pct,
+def fmt_number(value: Any, suffix: str = "", digits: int = 1) -> str:
+    if value is None:
+        return "—"
+    try:
+        return f"{float(value):.{digits}f}{suffix}"
+    except (TypeError, ValueError):
+        return f"{value}{suffix}"
+
+
+def cardinal(degrees: Any) -> str:
+    try:
+        deg = float(degrees) % 360
+    except (TypeError, ValueError):
+        return "—"
+    points = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    return points[round(deg / 45) % 8]
+
+
+def find_station_metadata(payload: dict[str, Any], station_id: str) -> dict[str, Any]:
+    for station in payload.get("stations", []):
+        if str(station.get("station_id")) == str(station_id) or str(station.get("station_id_uuid")) == str(station_id):
+            return station
+    return {}
+
+
+def station_coordinates(station: dict[str, Any]) -> tuple[float | None, float | None]:
+    lat_keys = ("latitude", "lat", "station_latitude")
+    lon_keys = ("longitude", "lon", "station_longitude")
+    lat = next((station.get(k) for k in lat_keys if station.get(k) is not None), FALLBACK_LAT)
+    lon = next((station.get(k) for k in lon_keys if station.get(k) is not None), FALLBACK_LON)
+    try:
+        return float(lat), float(lon)
+    except (TypeError, ValueError):
+        return None, None
+
+
+def openweather_record(payload: dict[str, Any]) -> dict[str, Any]:
+    data = payload.get("data", [])
+    return data[0] if data else {}
+
+
+def weather_description(record: dict[str, Any]) -> str:
+    weather = record.get("weather") or []
+    if weather and isinstance(weather[0], dict):
+        return str(weather[0].get("description", "Unknown")).title()
+    return "Unknown"
+
+
+require_secrets()
+
+st.title("Gillsburg Weather")
+st.caption("Live Davis WeatherLink conditions, OpenWeather forecasts, and current radar.")
+
+if st.sidebar.button("Refresh now", use_container_width=True):
+    st.cache_data.clear()
+    st.rerun()
+
+page = st.sidebar.radio("View", ["Home", "Forecast", "Radar"], index=0)
+
+try:
+    stations_payload = get_weatherlink_stations(
+        str(WEATHERLINK_API_KEY), str(WEATHERLINK_API_SECRET)
     )
+    station = find_station_metadata(stations_payload, str(WEATHERLINK_STATION_ID))
+    lat, lon = station_coordinates(station)
+except requests.RequestException as exc:
+    st.error(f"Could not retrieve WeatherLink station information: {exc}")
+    st.stop()
 
-
-@st.cache_data(ttl=600, show_spinner=False)
-def openweather_current(api_key: str, latitude: float, longitude: float) -> dict[str, Any]:
-    response = requests.get(
-        OPENWEATHER_CURRENT,
-        params={"lat": latitude, "lon": longitude, "appid": api_key, "units": "imperial"},
-        timeout=REQUEST_TIMEOUT,
+if lat is None or lon is None:
+    st.error(
+        "The station coordinates were not found. Add GILLSBURG_LAT and GILLSBURG_LON "
+        "to Streamlit Secrets, then restart the app."
     )
-    response.raise_for_status()
-    return response.json()
+    st.stop()
 
+if page == "Home":
+    try:
+        wl_payload = get_weatherlink_current(
+            str(WEATHERLINK_API_KEY),
+            str(WEATHERLINK_API_SECRET),
+            str(WEATHERLINK_STATION_ID),
+        )
+        records = flatten_weatherlink_records(wl_payload)
+    except requests.RequestException as exc:
+        st.error(f"WeatherLink request failed: {exc}")
+        records = []
 
-def parse_openweather(name: str, region: str, latitude: float, longitude: float, payload: dict[str, Any]) -> Conditions:
-    wind = payload.get("wind", {})
-    main = payload.get("main", {})
-    rain = payload.get("rain", {})
-    weather = payload.get("weather", [])
-    # OpenWeather rain is the accumulation over the previous 1 or 3 hours in mm.
-    rain_mm = safe_float(rain.get("1h"))
-    if rain_mm is None:
-        rain_mm = safe_float(rain.get("3h"))
-    rain_in = rain_mm / 25.4 if rain_mm is not None else 0.0
-    pressure_hpa = safe_float(main.get("sea_level")) or safe_float(main.get("pressure"))
-    pressure_inhg = pressure_hpa * 0.0295299830714 if pressure_hpa is not None else None
-    timestamp = safe_float(payload.get("dt"))
+    temp = first_value(records, "temp", "temp_out", "temp_last")
+    humidity = first_value(records, "hum", "hum_out", "humidity")
+    dew_point = first_value(records, "dew_point", "dew_point_out")
+    wind_speed = first_value(records, "wind_speed_last", "wind_speed", "wind_speed_avg_last_10_min")
+    wind_dir = first_value(records, "wind_dir_last", "wind_dir")
+    gust = first_value(records, "wind_speed_hi_last_10_min", "wind_gust", "wind_speed_hi")
+    rain_today = first_value(records, "rainfall_daily", "rain_day", "rainfall_day")
+    rain_rate = first_value(records, "rain_rate_last", "rain_rate")
+    pressure = first_value(records, "bar_sea_level", "bar_absolute", "bar")
+    solar = first_value(records, "solar_rad", "solar_radiation")
+    uv = first_value(records, "uv_index", "uv")
+    ts = first_value(records, "ts")
 
-    return Conditions(
-        name=name,
-        source="OpenWeather",
-        region=region,
-        latitude=latitude,
-        longitude=longitude,
-        observed_at=datetime.fromtimestamp(timestamp) if timestamp else None,
-        wind_mph=safe_float(wind.get("speed")),
-        gust_mph=safe_float(wind.get("gust")),
-        wind_degrees=safe_float(wind.get("deg")),
-        rain_in=rain_in,
-        pressure_inhg=pressure_inhg,
-        temperature_f=safe_float(main.get("temp")),
-        humidity_pct=safe_float(main.get("humidity")),
-        description=(weather[0].get("description", "").title() if weather else None),
-    )
+    st.subheader(station.get("station_name", "Gillsburg Davis Station"))
 
+    row1 = st.columns(4)
+    row1[0].metric("Temperature", fmt_number(temp, " °F"))
+    row1[1].metric("Humidity", fmt_number(humidity, " %", 0))
+    row1[2].metric("Dew point", fmt_number(dew_point, " °F"))
+    row1[3].metric("Pressure", fmt_number(pressure, " inHg", 2))
 
-def load_locations() -> pd.DataFrame:
-    required = {"display_name", "latitude", "longitude", "region", "source"}
-    frame = pd.read_csv(LOCATIONS_FILE)
-    missing = required.difference(frame.columns)
-    if missing:
-        raise ValueError(f"locations.csv is missing: {', '.join(sorted(missing))}")
-    frame["latitude"] = pd.to_numeric(frame["latitude"], errors="raise")
-    frame["longitude"] = pd.to_numeric(frame["longitude"], errors="raise")
-    frame["source"] = frame["source"].str.lower().str.strip()
-    return frame
+    row2 = st.columns(4)
+    row2[0].metric("Wind", fmt_number(wind_speed, " mph"), cardinal(wind_dir))
+    row2[1].metric("Gust", fmt_number(gust, " mph"))
+    row2[2].metric("Rain today", fmt_number(rain_today, " in", 2))
+    row2[3].metric("Rain rate", fmt_number(rain_rate, " in/hr", 2))
 
+    row3 = st.columns(2)
+    row3[0].metric("Solar radiation", fmt_number(solar, " W/m²", 0))
+    row3[1].metric("UV index", fmt_number(uv, "", 1))
 
-def card(condition: Conditions, featured: bool = False) -> None:
-    border = "2px solid #245b7a" if featured else "1px solid rgba(128,128,128,.35)"
-    background = "rgba(36,91,122,.08)" if featured else "rgba(128,128,128,.04)"
-    status = condition.description or condition.source
-    wind_direction = f"{wind_compass(condition.wind_degrees)} {fmt(condition.wind_degrees, 0)}°" if condition.wind_degrees is not None else "—"
-    gust = fmt(condition.gust_mph)
-    rain_note = "Today" if condition.source.startswith("Davis") else "Recent interval"
-    error_html = f'<div class="error">{condition.error}</div>' if condition.error else ""
-    st.markdown(
-        f"""
-        <div class="station-card" style="border:{border};background:{background}">
-          <div class="station-title">{condition.name}</div>
-          <div class="station-subtitle">{condition.region} · {status}</div>
-          {error_html}
-          <div class="metric-grid">
-            <div><span>WIND</span><strong>{fmt(condition.wind_mph)} mph</strong><small>{wind_direction}</small></div>
-            <div><span>GUST</span><strong>{gust} mph</strong><small>Current reported gust</small></div>
-            <div><span>RAIN</span><strong>{fmt(condition.rain_in, 2)} in</strong><small>{rain_note}</small></div>
-            <div><span>PRESSURE</span><strong>{fmt(condition.pressure_inhg, 2)} inHg</strong><small>Sea-level when available</small></div>
-          </div>
-          <div class="station-footer">{observation_age(condition.observed_at)} · {condition.source}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    if ts:
+        try:
+            updated = datetime.fromtimestamp(int(ts), tz=timezone.utc).astimezone()
+            st.caption(f"WeatherLink updated {updated:%b %d, %Y at %I:%M:%S %p %Z}")
+        except Exception:
+            pass
 
+    st.divider()
+    try:
+        ow_current = openweather_record(
+            get_openweather_current(str(OPENWEATHER_API_KEY), lat, lon)
+        )
+        st.subheader("OpenWeather outlook")
+        a, b, c, d = st.columns(4)
+        a.metric("Feels like", fmt_number(ow_current.get("feels_like"), " °F"))
+        b.metric("Cloud cover", fmt_number(ow_current.get("clouds"), " %", 0))
+        c.metric("Visibility", fmt_number((ow_current.get("visibility") or 0) / 1609.344, " mi"))
+        d.metric("UV index", fmt_number(ow_current.get("uvi"), "", 1))
+        st.info(weather_description(ow_current))
+    except requests.RequestException as exc:
+        st.warning(f"OpenWeather current conditions are unavailable: {exc}")
 
-def main() -> None:
-    st.set_page_config(page_title="Gillsburg Weather Perimeter", page_icon="🌧️", layout="wide")
-    st.markdown(
-        """
-        <style>
-        .block-container {padding-top: 1.1rem; padding-bottom: 2rem; max-width: 1450px;}
-        .station-card {border-radius: 14px; padding: 16px; margin: 8px 0 16px; min-height: 260px;}
-        .station-title {font-size: 1.45rem; font-weight: 750; line-height: 1.15;}
-        .station-subtitle {opacity: .72; margin-top: 4px; margin-bottom: 14px;}
-        .metric-grid {display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px;}
-        .metric-grid div {padding:10px; border-radius:10px; background:rgba(128,128,128,.08);}
-        .metric-grid span {display:block; font-size:.72rem; letter-spacing:.08em; opacity:.65;}
-        .metric-grid strong {display:block; font-size:1.45rem; margin-top:3px;}
-        .metric-grid small {display:block; opacity:.65; margin-top:2px;}
-        .station-footer {font-size:.82rem; opacity:.65; margin-top:14px;}
-        .error {padding:8px; border-radius:8px; background:rgba(190,40,40,.13); margin-bottom:12px;}
-        @media (max-width: 640px) {
-          .block-container {padding-left:.75rem; padding-right:.75rem;}
-          .metric-grid {grid-template-columns:1fr 1fr; gap:8px;}
-          .metric-grid strong {font-size:1.22rem;}
-          .station-card {min-height:auto;}
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+elif page == "Forecast":
+    try:
+        min_payload = get_openweather_15min(str(OPENWEATHER_API_KEY), lat, lon)
+        min_records = min_payload.get("data", [])
+        min_df = pd.DataFrame(min_records)
+        if not min_df.empty:
+            min_df["time"] = pd.to_datetime(min_df["dt"], unit="s", utc=True).dt.tz_convert(
+                min_payload.get("timezone", "America/Chicago")
+            )
+            min_df["rain chance"] = min_df.get("pop", 0) * 100
 
-    st.title("Gillsburg Weather Perimeter")
-    st.caption("Current wind, gust, rain and barometric pressure — home station centered with Gulf Coast monitoring points.")
+            st.subheader("Next 12 hours")
+            chart = (
+                alt.Chart(min_df.head(48))
+                .mark_line(point=False)
+                .encode(
+                    x=alt.X("time:T", title="Time"),
+                    y=alt.Y("temp:Q", title="Temperature (°F)"),
+                    tooltip=[
+                        alt.Tooltip("time:T", title="Time"),
+                        alt.Tooltip("temp:Q", title="Temp", format=".1f"),
+                        alt.Tooltip("rain chance:Q", title="Rain chance", format=".0f"),
+                    ],
+                )
+                .properties(height=320)
+            )
+            st.altair_chart(chart, use_container_width=True)
 
-    refresh_minutes = st.sidebar.select_slider("Refresh interval", options=[5, 10, 15, 30], value=10)
-    st_autorefresh(interval=refresh_minutes * 60 * 1000, key="weather_refresh")
-    if st.sidebar.button("Refresh now", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
+            rain_chart = (
+                alt.Chart(min_df.head(48))
+                .mark_area(opacity=0.4)
+                .encode(
+                    x=alt.X("time:T", title="Time"),
+                    y=alt.Y("rain chance:Q", title="Rain chance (%)", scale=alt.Scale(domain=[0, 100])),
+                    tooltip=[
+                        alt.Tooltip("time:T", title="Time"),
+                        alt.Tooltip("rain chance:Q", title="Rain chance", format=".0f"),
+                    ],
+                )
+                .properties(height=220)
+            )
+            st.altair_chart(rain_chart, use_container_width=True)
+
+        daily_payload = get_openweather_daily(str(OPENWEATHER_API_KEY), lat, lon)
+        daily = daily_payload.get("data", [])
+        st.subheader("Daily forecast")
+        cols = st.columns(min(5, len(daily)))
+        tz_name = daily_payload.get("timezone", "America/Chicago")
+        for idx, day in enumerate(daily[:5]):
+            local_date = pd.to_datetime(day["dt"], unit="s", utc=True).tz_convert(tz_name)
+            temp_obj = day.get("temp", {}) if isinstance(day.get("temp"), dict) else {}
+            with cols[idx]:
+                st.markdown(f"**{local_date:%A}**")
+                st.write(weather_description(day))
+                st.metric("High", fmt_number(temp_obj.get("max"), " °F"))
+                st.metric("Low", fmt_number(temp_obj.get("min"), " °F"))
+                st.write(f"Rain chance: {fmt_number((day.get('pop') or 0) * 100, '%', 0)}")
+    except requests.RequestException as exc:
+        st.error(f"OpenWeather forecast request failed: {exc}")
+
+    st.caption("Weather forecast data © OpenWeather")
+
+else:
+    st.subheader("Current radar")
+    st.caption("Latest available radar frame centered on the Gillsburg station.")
 
     try:
-        locations = load_locations()
+        radar_index = get_rainviewer_index()
+        host = radar_index["host"]
+        frames = radar_index.get("radar", {}).get("past", [])
+        if not frames:
+            raise RuntimeError("No radar frames were returned.")
+        latest = frames[-1]
+        tile_url = f"{host}{latest['path']}/256/{{z}}/{{x}}/{{y}}/2/1_1.png"
+
+        radar_map = folium.Map(
+            location=[lat, lon],
+            zoom_start=7,
+            tiles="OpenStreetMap",
+            control_scale=True,
+        )
+        folium.TileLayer(
+            tiles=tile_url,
+            attr="Radar © RainViewer; map © OpenStreetMap contributors",
+            name="Current radar",
+            overlay=True,
+            opacity=0.75,
+        ).add_to(radar_map)
+        folium.Marker(
+            [lat, lon],
+            tooltip=station.get("station_name", "Gillsburg"),
+            icon=folium.Icon(color="red", icon="home"),
+        ).add_to(radar_map)
+        folium.LayerControl().add_to(radar_map)
+
+        st_folium(radar_map, use_container_width=True, height=600)
+        frame_time = datetime.fromtimestamp(int(latest["time"]), tz=timezone.utc).astimezone()
+        st.caption(f"Radar frame: {frame_time:%b %d, %Y at %I:%M %p %Z}")
     except Exception as exc:
-        st.error(f"Could not read locations.csv: {exc}")
-        st.stop()
+        st.error(f"Radar is unavailable: {exc}")
 
-    openweather_key = str(secret("OPENWEATHER_API_KEY", "")).strip()
-    wl_key = str(secret("WEATHERLINK_API_KEY", "")).strip()
-    wl_secret = str(secret("WEATHERLINK_API_SECRET", "")).strip()
-    configured_station_id = int(secret("WEATHERLINK_STATION_ID", 0) or 0)
-
-    conditions: list[Conditions] = []
-    discovered_station_id: int | None = None
-    discovered_station_name: str | None = None
-
-    for row in locations.itertuples(index=False):
-        if row.source == "weatherlink":
-            if not wl_key or not wl_secret:
-                conditions.append(Conditions(row.display_name, "Davis WeatherLink", row.region, row.latitude, row.longitude, error="WeatherLink credentials have not been entered in secrets.toml."))
-                continue
-            try:
-                station_id = configured_station_id
-                if station_id <= 0:
-                    stations = weatherlink_stations(wl_key, wl_secret)
-                    if not stations:
-                        raise RuntimeError("No stations are available to this WeatherLink API account.")
-                    station_id = int(stations[0]["station_id"])
-                    discovered_station_id = station_id
-                    discovered_station_name = str(stations[0].get("station_name", "WeatherLink station"))
-                payload = weatherlink_current(wl_key, wl_secret, station_id)
-                conditions.append(parse_weatherlink(row.display_name, row.region, row.latitude, row.longitude, payload))
-            except requests.HTTPError as exc:
-                message = f"WeatherLink request failed ({exc.response.status_code}). Check the API key, secret and station permission."
-                conditions.append(Conditions(row.display_name, "Davis WeatherLink", row.region, row.latitude, row.longitude, error=message))
-            except Exception as exc:
-                conditions.append(Conditions(row.display_name, "Davis WeatherLink", row.region, row.latitude, row.longitude, error=str(exc)))
-        elif row.source == "openweather":
-            if not openweather_key:
-                conditions.append(Conditions(row.display_name, "OpenWeather", row.region, row.latitude, row.longitude, error="OpenWeather API key has not been entered in secrets.toml."))
-                continue
-            try:
-                payload = openweather_current(openweather_key, row.latitude, row.longitude)
-                conditions.append(parse_openweather(row.display_name, row.region, row.latitude, row.longitude, payload))
-            except requests.HTTPError as exc:
-                message = f"OpenWeather request failed ({exc.response.status_code}). Check that the new API key is active."
-                conditions.append(Conditions(row.display_name, "OpenWeather", row.region, row.latitude, row.longitude, error=message))
-            except Exception as exc:
-                conditions.append(Conditions(row.display_name, "OpenWeather", row.region, row.latitude, row.longitude, error=str(exc)))
-
-    home = [c for c in conditions if c.source.startswith("Davis")]
-    perimeter = [c for c in conditions if not c.source.startswith("Davis")]
-
-    st.subheader("Home conditions")
-    if home:
-        card(home[0], featured=True)
-    else:
-        st.warning("No Davis home-station row was found in locations.csv.")
-
-    st.subheader("Gulf Coast perimeter")
-    columns = st.columns(3)
-    for index, condition in enumerate(perimeter):
-        with columns[index % 3]:
-            card(condition)
-
-    with st.sidebar:
-        st.divider()
-        st.caption("Data notes")
-        st.caption("Davis rain is daily rainfall when that field is available. OpenWeather rain is the most recent 1-hour or 3-hour accumulation reported by the API.")
-        st.caption("Use official NWS alerts and warnings for safety decisions. This dashboard is for situational awareness.")
-        if discovered_station_id:
-            st.success(f"WeatherLink station found: {discovered_station_name}\n\nStation ID: {discovered_station_id}")
-            st.caption("Enter this number as WEATHERLINK_STATION_ID in secrets.toml to lock the app to this station.")
-
-
-if __name__ == "__main__":
-    main()
+st.divider()
+st.caption("WeatherLink data from Davis Instruments. Forecast data © OpenWeather. Radar © RainViewer.")
