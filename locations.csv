@@ -1,0 +1,17 @@
+display_name,latitude,longitude,region,source
+Gillsburg,31.15612,-90.807564,Center,weatherlink
+Pecan Island,30.61306,-91.425911,Southwest,openweather
+Morgan City,29.698441,-91.19706,Southwest,openweather
+Fourchon,29.152156,-90.181668,South,openweather
+Hammond,30.503702,-90.458293,South,openweather
+Venice,29.207874,-89.339453,Southeast,openweather
+Chalmette,29.95848,-89.950593,Southeast,openweather
+Covington,30.477752,-90.107136,Southeast,openweather
+Waveland,30.287327,-89.375023,Southeast,openweather
+Baton Rouge,30.643419,-91.156852,West,openweather
+Natchez,31.561592,-91.405318,West,openweather
+Vicksburg,32.348144,-90.882456,North,openweather
+Jackson,32.302897,-90.183488,North,openweather
+Laurel,31.691209,-89.129865,Northeast,openweather
+Hattiesburg,31.326464,-89.289661,East,openweather
+Franklinton,30.845394,-90.154549,East,openweather
