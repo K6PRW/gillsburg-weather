@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Iterable
 
 import altair as alt
@@ -102,6 +102,100 @@ def get_openweather_daily(api_key: str, lat: float, lon: float) -> dict[str, Any
     )
 
 
+@st.cache_data(ttl=21600, show_spinner=False)
+def get_openweather_history_daily(
+    api_key: str,
+    lat: float,
+    lon: float,
+    days: int,
+) -> dict[str, Any]:
+    """Retrieve the requested number of daily records, walking backward in time."""
+    days = max(1, min(int(days), 365))
+    start_dt = datetime.combine(
+        date.today() - timedelta(days=1),
+        time(hour=12),
+        tzinfo=timezone.utc,
+    )
+    url = f"{OPENWEATHER_BASE}/timeline/1day"
+    params: dict[str, Any] | None = {
+        "lat": lat,
+        "lon": lon,
+        "units": "imperial",
+        "lang": "en",
+        "start": int(start_dt.timestamp()),
+        "cnt": 10,
+        "appid": api_key,
+    }
+
+    collected: dict[int, dict[str, Any]] = {}
+    timezone_name = "America/Chicago"
+    max_pages = (days + 9) // 10 + 2
+
+    for _ in range(max_pages):
+        payload = get_json(url, params=params)
+        timezone_name = payload.get("timezone", timezone_name)
+
+        for record in payload.get("data", []):
+            record_dt = int(record.get("dt", 0))
+            if record_dt:
+                collected[record_dt] = record
+
+        if len(collected) >= days:
+            break
+
+        previous_url = payload.get("prev")
+        if not previous_url:
+            break
+
+        url = previous_url
+        params = None
+
+    records = [
+        collected[key]
+        for key in sorted(collected.keys(), reverse=True)[:days]
+    ]
+    records.reverse()
+    return {"timezone": timezone_name, "data": records}
+
+
+def rain_inches(record: dict[str, Any]) -> float:
+    """Normalize daily rain values to inches."""
+    rain = record.get("rain", 0)
+    if isinstance(rain, dict):
+        rain = rain.get("1h", rain.get("day", 0))
+    try:
+        return float(rain or 0) / 25.4
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def history_dataframe(payload: dict[str, Any]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    tz_name = payload.get("timezone", "America/Chicago")
+
+    for item in payload.get("data", []):
+        temp = item.get("temp", {})
+        if not isinstance(temp, dict):
+            temp = {}
+        rows.append(
+            {
+                "Date": pd.to_datetime(
+                    item.get("dt"), unit="s", utc=True
+                ).tz_convert(tz_name).date(),
+                "High °F": temp.get("max"),
+                "Low °F": temp.get("min"),
+                "Average °F": temp.get("day"),
+                "Rain in": rain_inches(item),
+                "Humidity %": item.get("humidity"),
+                "Pressure hPa": item.get("pressure"),
+                "Wind mph": item.get("wind_speed"),
+                "Gust mph": item.get("wind_gust"),
+                "Conditions": weather_description(item),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def get_rainviewer_index() -> dict[str, Any]:
     return get_json(RAINVIEWER_INDEX)
@@ -182,7 +276,7 @@ if st.sidebar.button("Refresh now", use_container_width=True):
     st.cache_data.clear()
     st.rerun()
 
-page = st.sidebar.radio("View", ["Home", "Forecast", "Radar"], index=0)
+page = st.sidebar.radio("View", ["Home", "Forecast", "History", "Radar"], index=0)
 
 try:
     stations_payload = get_weatherlink_stations(
@@ -327,6 +421,116 @@ elif page == "Forecast":
         st.error(f"OpenWeather forecast request failed: {exc}")
 
     st.caption("Weather forecast data © OpenWeather")
+
+elif page == "History":
+    st.subheader("Historical weather")
+    st.caption(
+        "OpenWeather daily history for the Gillsburg location. "
+        "Choose a shorter period to minimize API calls."
+    )
+
+    period = st.segmented_control(
+        "History period",
+        options=[7, 30, 90, 365],
+        default=30,
+        format_func=lambda value: f"{value} days" if value < 365 else "1 year",
+    )
+    if period is None:
+        period = 30
+
+    try:
+        history_payload = get_openweather_history_daily(
+            str(OPENWEATHER_API_KEY), lat, lon, int(period)
+        )
+        history_df = history_dataframe(history_payload)
+
+        if history_df.empty:
+            st.warning("No historical records were returned.")
+        else:
+            metric_cols = st.columns(4)
+            metric_cols[0].metric(
+                "Highest temperature",
+                f"{history_df['High °F'].max():.1f} °F",
+            )
+            metric_cols[1].metric(
+                "Lowest temperature",
+                f"{history_df['Low °F'].min():.1f} °F",
+            )
+            metric_cols[2].metric(
+                "Total precipitation",
+                f"{history_df['Rain in'].sum():.2f} in",
+            )
+            metric_cols[3].metric(
+                "Average humidity",
+                f"{history_df['Humidity %'].mean():.0f}%",
+            )
+
+            temp_long = history_df.melt(
+                id_vars=["Date"],
+                value_vars=["High °F", "Low °F", "Average °F"],
+                var_name="Series",
+                value_name="Temperature",
+            )
+            temp_chart = (
+                alt.Chart(temp_long)
+                .mark_line()
+                .encode(
+                    x=alt.X("Date:T", title="Date"),
+                    y=alt.Y("Temperature:Q", title="Temperature (°F)"),
+                    color=alt.Color("Series:N", title=""),
+                    tooltip=[
+                        alt.Tooltip("Date:T", title="Date"),
+                        alt.Tooltip("Series:N", title="Reading"),
+                        alt.Tooltip("Temperature:Q", format=".1f"),
+                    ],
+                )
+                .properties(height=330)
+            )
+            st.altair_chart(temp_chart, use_container_width=True)
+
+            rain_chart = (
+                alt.Chart(history_df)
+                .mark_bar()
+                .encode(
+                    x=alt.X("Date:T", title="Date"),
+                    y=alt.Y("Rain in:Q", title="Precipitation (inches)"),
+                    tooltip=[
+                        alt.Tooltip("Date:T", title="Date"),
+                        alt.Tooltip("Rain in:Q", title="Rain", format=".2f"),
+                    ],
+                )
+                .properties(height=250)
+            )
+            st.altair_chart(rain_chart, use_container_width=True)
+
+            display_df = history_df.copy()
+            numeric_formats = {
+                "High °F": "{:.1f}",
+                "Low °F": "{:.1f}",
+                "Average °F": "{:.1f}",
+                "Rain in": "{:.2f}",
+                "Humidity %": "{:.0f}",
+                "Pressure hPa": "{:.0f}",
+                "Wind mph": "{:.1f}",
+                "Gust mph": "{:.1f}",
+            }
+            st.dataframe(
+                display_df.style.format(numeric_formats, na_rep="—"),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            csv_data = history_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download history as CSV",
+                data=csv_data,
+                file_name=f"gillsburg_weather_history_{period}_days.csv",
+                mime="text/csv",
+            )
+    except requests.RequestException as exc:
+        st.error(f"OpenWeather historical request failed: {exc}")
+
+    st.caption("Historical weather data © OpenWeather")
 
 else:
     st.subheader("Current radar")
